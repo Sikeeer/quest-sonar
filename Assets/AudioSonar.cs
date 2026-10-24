@@ -43,8 +43,7 @@ public class AudioSonar : MonoBehaviour
     [Tooltip("Точка выше этого над полом = высокий резкий тон")]
     public float highFrom = 0.9f;
 
-    [Header("Опасность")]
-    public float dangerDistance = 0.6f;
+    [Header("Опасность (порог берётся из ObstacleMap.dangerDistance)")]
     public bool haptics = true;
 
     [Header("Обрыв / ступеньки вниз")]
@@ -80,6 +79,9 @@ public class AudioSonar : MonoBehaviour
     // пентатоника (полутоны от основной ноты): любые две ноты звучат созвучно, поэтому писки не режут слух
     static readonly int[] Penta = { 0, 2, 4, 7, 9, 12, 14, 16 };
 
+    const float RampStart = 0.3f;     // до этого расстояния звук считается "вплотную" (интервал и громкость на максимуме)
+    const int SampleRate = 48000;
+
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Boot()
     {
@@ -89,16 +91,9 @@ public class AudioSonar : MonoBehaviour
 
     IEnumerator Start()
     {
-        float t = 0;
-        while ((FindFirstObjectByType<OVRCameraRig>() == null || ObstacleMap.Instance == null) && t < 15f)
-        {
-            t += Time.deltaTime;
-            yield return null;
-        }
+        yield return SonarCommon.WaitUntilReady(() => ObstacleMap.Instance != null);
 
-        var rig = FindFirstObjectByType<OVRCameraRig>();
-        if (rig != null) head = rig.centerEyeAnchor;
-        else if (Camera.main != null) head = Camera.main.transform;
+        head = SonarCommon.FindHead();
         map = ObstacleMap.Instance;
         if (head == null || map == null) { Debug.LogError("AudioSonar: нет головы или ObstacleMap."); yield break; }
 
@@ -178,10 +173,10 @@ public class AudioSonar : MonoBehaviour
         if (toggleWithButtons &&
             (OVRInput.GetDown(OVRInput.Button.One) || OVRInput.GetDown(OVRInput.Button.Three)))
         {
-            // подтверждающий сигнал: перед выключением низкий, после включения высокий
-            if (!muted) { dropSrc.volume = masterVolume; dropSrc.PlayOneShot(clipLow); }
+            // подтверждающий сигнал: при выключении низкий, при включении высокий
+            dropSrc.volume = masterVolume;
+            dropSrc.PlayOneShot(muted ? clipHigh : clipLow);
             muted = !muted;
-            if (!muted) { dropSrc.volume = masterVolume; dropSrc.PlayOneShot(clipHigh); }
             if (muted) { SetHaptics(false); foreach (var s in src) s.Stop(); }
         }
 
@@ -202,14 +197,10 @@ public class AudioSonar : MonoBehaviour
 
         float now = Time.time;
 
-        // сортируем сектора по близости (их мало), озвучиваем только activeSectors ближайших
-        for (int i = 0; i < sectors; i++)
-        {
-            int j = i;
-            while (j > 0 && pub[order[j - 1]] > pub[i]) { order[j] = order[j - 1]; j--; }
-            order[j] = i;
-        }
+        // озвучиваем только activeSectors ближайших секторов
+        SortSectorsByDistance();
         float nearest = pub[order[0]] < maxRange ? pub[order[0]] : float.MaxValue;
+        float danger = map.dangerDistance;
 
         for (int n = 0; n < sectors && n < activeSectors; n++)
         {
@@ -219,10 +210,10 @@ public class AudioSonar : MonoBehaviour
 
             if (now < nextBeep[i] || now - lastOnset < minOnsetGap) continue;
 
-            bool danger = d < dangerDistance;
-            float k = Mathf.Clamp01((d - 0.3f) / Mathf.Max(0.01f, maxRange - 0.3f));
-            float interval = danger ? minInterval : Mathf.Lerp(minInterval, maxInterval, k);
-            float vol = danger ? nearVolume : Mathf.Lerp(nearVolume, farVolume, k);
+            bool isDanger = d < danger;
+            float k = Mathf.Clamp01((d - RampStart) / Mathf.Max(0.01f, maxRange - RampStart));
+            float interval = isDanger ? minInterval : Mathf.Lerp(minInterval, maxInterval, k);
+            float vol = isDanger ? nearVolume : Mathf.Lerp(nearVolume, farVolume, k);
 
             var s = src[i];
             s.transform.localPosition = pubDir[i] * Mathf.Min(d, maxSourceDistance);
@@ -237,22 +228,34 @@ public class AudioSonar : MonoBehaviour
 
         if (dropActive && now >= nextDrop)
         {
-            dropSrc.transform.localPosition = dropDir * 1.0f;
+            dropSrc.transform.localPosition = dropDir;
             dropSrc.volume = masterVolume;
             dropSrc.PlayOneShot(clipDrop);
             nextDrop = now + dropRepeat;
         }
 
-        SetHaptics(haptics && nearest < dangerDistance);
+        SetHaptics(haptics && nearest < danger);
+    }
+
+    /// <summary>Заполняет order индексами секторов по возрастанию расстояния (секторов мало, хватает вставок).</summary>
+    void SortSectorsByDistance()
+    {
+        for (int i = 0; i < sectors; i++)
+        {
+            int j = i;
+            while (j > 0 && pub[order[j - 1]] > pub[i]) { order[j] = order[j - 1]; j--; }
+            order[j] = i;
+        }
     }
 
     void SetHaptics(bool on)
     {
         if (on == hapticOn) return;
         hapticOn = on;
-        float a = on ? 0.6f : 0f;
-        OVRInput.SetControllerVibration(on ? 0.5f : 0f, a, OVRInput.Controller.RTouch);
-        OVRInput.SetControllerVibration(on ? 0.5f : 0f, a, OVRInput.Controller.LTouch);
+        float frequency = on ? 0.5f : 0f;
+        float amplitude = on ? 0.6f : 0f;
+        OVRInput.SetControllerVibration(frequency, amplitude, OVRInput.Controller.RTouch);
+        OVRInput.SetControllerVibration(frequency, amplitude, OVRInput.Controller.LTouch);
     }
 
     // ---------------------------------------------------------------- создание источников и клипов
@@ -301,7 +304,7 @@ public class AudioSonar : MonoBehaviour
     // Мягкий "щипковый" звук: плавная атака, экспоненциальное затухание, чуть шума (~5%, он помогает локализации).
     static AudioClip MakeSoft(string name, float freq, bool bell, float len)
     {
-        const int sr = 48000;
+        const int sr = SampleRate;
         int n = (int)(sr * len);
         var data = new float[n];
         var rnd = new System.Random(1234);
@@ -324,14 +327,12 @@ public class AudioSonar : MonoBehaviour
             float noise = ((float)rnd.NextDouble() * 2f - 1f) * 0.05f;
             data[i] = (s * 0.5f + noise) * a * decay * tail * 0.8f;
         }
-        var c = AudioClip.Create(name, n, 1, sr, false);
-        c.SetData(data, 0);
-        return c;
+        return MakeClip(name, data);
     }
 
     static AudioClip MakeChirp(string name, float f0, float f1, float len)
     {
-        const int sr = 48000;
+        const int sr = SampleRate;
         int n = (int)(sr * len);
         var data = new float[n];
         float phase = 0f;
@@ -343,7 +344,12 @@ public class AudioSonar : MonoBehaviour
             float env = Mathf.Min(1f, i / (0.01f * sr)) * (1f - u);
             data[i] = (Mathf.Sin(phase) + 0.4f * Mathf.Sin(2f * phase)) * 0.6f * env;
         }
-        var c = AudioClip.Create(name, n, 1, sr, false);
+        return MakeClip(name, data);
+    }
+
+    static AudioClip MakeClip(string name, float[] data)
+    {
+        var c = AudioClip.Create(name, data.Length, 1, SampleRate, false);
         c.SetData(data, 0);
         return c;
     }

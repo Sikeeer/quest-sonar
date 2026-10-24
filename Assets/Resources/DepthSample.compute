@@ -1,0 +1,152 @@
+// Облако точек из текстуры глубины Quest 3 (EnvironmentDepthManager, Meta XR Core SDK).
+//
+// Kernel Sample / Sample2D: сетка _GridW x _GridH точек из слоя _Slice текстуры -> мировые точки
+//   в кольцевой буфер _Points по смещению _BaseIndex. Точка: xyz = мир, w = расстояние от головы (0 = нет данных).
+// Kernel BuildQuads: для всех точек кольцевого буфера строит квады (4 вершины по 20 байт: позиция float3,
+//   цвет RGBA8, uv half2) прямо в вершинный буфер меша (DepthPointCloud). Цвет = высота над полом,
+//   прозрачность = возраст кадра.
+//
+// Математика восстановления (по исходникам Meta: EnvironmentDepthUtils.cs, EnvironmentOcclusion.cginc,
+// MRUK EnvironmentDepthRaycaster):
+//   _EnvironmentDepthReprojectionMatrices[eye] переводит МИРОВУЮ точку в clip-пространство камеры глубины
+//   (проекция в стиле OpenGL), uv = (clip.xy / clip.w + 1) / 2 без переворота Y, NDC-z = raw * 2 - 1,
+//   линейная глубина = ZB.x / (ndcZ + ZB.y). Значит мир = inverse(VP) * (uv * 2 - 1, raw * 2 - 1, 1)
+//   с делением на w. raw == 1 означает "нет глубины".
+
+#pragma kernel Sample
+#pragma kernel Sample2D
+#pragma kernel BuildQuads
+
+// ---------------------------------------------------------------- Sample
+Texture2DArray<float> _Depth;        // _EnvironmentDepthTexture (слои = глаза)
+Texture2D<float>      _Depth2D;      // запасной вариант, если текстура окажется не массивом
+RWStructuredBuffer<float4> _Points;  // кольцевой буфер точек
+
+float4x4 _InvVP;        // обратная матрица репроекции камеры глубины (clip -> мир)
+float4   _HeadPos;      // позиция головы (для w = расстояние)
+float4   _ZB;           // _EnvironmentDepthZBufferParams
+int      _GridW, _GridH;
+int      _DepthW, _DepthH;
+int      _Slice;
+int      _FlipY;
+int      _BaseIndex;    // смещение текущего слота в кольцевом буфере
+float2   _Jitter;       // сдвиг сетки внутри ячейки (0..1), меняется каждый кадр
+float    _MinDist, _MaxDist;
+
+int2 PixelOf(uint2 id)
+{
+    float2 uv = (float2(id) + _Jitter) / float2(_GridW, _GridH);
+    return clamp(int2(uv * float2(_DepthW, _DepthH)), int2(0, 0), int2(_DepthW - 1, _DepthH - 1));
+}
+
+void WritePoint(uint2 id, int2 px, float raw)
+{
+    uint idx = (uint)_BaseIndex + id.y * (uint)_GridW + id.x;
+
+    float2 uvc = (float2(px) + 0.5) / float2(_DepthW, _DepthH);
+    if (_FlipY != 0) uvc.y = 1.0 - uvc.y;
+
+    float ndcZ = raw * 2.0 - 1.0;
+    float4 h = mul(_InvVP, float4(uvc * 2.0 - 1.0, ndcZ, 1.0));
+    float3 p = h.xyz / h.w;
+
+    float linearDepth = _ZB.x / (ndcZ + _ZB.y);      // метры вдоль оси камеры глубины (формула Meta)
+    float dist = distance(p, _HeadPos.xyz);
+
+    bool ok = raw > 0.0 && raw < 1.0 && abs(h.w) > 1e-6
+              && linearDepth > 0.0 && linearDepth < _MaxDist * 1.5
+              && all(isfinite(p))
+              && dist > _MinDist && dist < _MaxDist;
+
+    _Points[idx] = ok ? float4(p, dist) : float4(0, 0, 0, 0);
+}
+
+[numthreads(8, 8, 1)]
+void Sample(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridW || id.y >= (uint)_GridH) return;
+    int2 px = PixelOf(id.xy);
+    WritePoint(id.xy, px, _Depth.Load(int4(px, _Slice, 0)));
+}
+
+[numthreads(8, 8, 1)]
+void Sample2D(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_GridW || id.y >= (uint)_GridH) return;
+    int2 px = PixelOf(id.xy);
+    WritePoint(id.xy, px, _Depth2D.Load(int3(px, 0)));
+}
+
+// ---------------------------------------------------------------- BuildQuads
+RWByteAddressBuffer _Verts;     // вершинный буфер меша: 4 вершины по 20 байт на точку
+int    _TotalPoints;            // точек в кольцевом буфере
+int    _SlotSize;               // точек в одном кадре (слоте)
+int    _History;                // слотов в кольце
+int    _WriteSlot;              // слот самого свежего кадра
+float4 _CamRight, _CamUp;       // оси камеры: квады повёрнуты к голове
+float  _PointSize;              // размер квада, м
+float  _FloorY;                 // высота пола (ObstacleMap.floorY)
+float  _ColorHeightRange;       // высота над полом, на которой цвет становится красным
+float  _MinAlpha;               // прозрачность самого старого кадра
+
+#define VERTEX_STRIDE 20
+
+float3 Hsv2Rgb(float3 c)
+{
+    float3 rgb = clamp(abs(fmod(c.x * 6.0 + float3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+    return c.z * lerp(float3(1.0, 1.0, 1.0), rgb, c.y);
+}
+
+uint PackRgba8(float4 c)
+{
+    uint4 u = (uint4)round(saturate(c) * 255.0);
+    return u.x | (u.y << 8) | (u.z << 16) | (u.w << 24);
+}
+
+uint PackHalf2(float2 v)
+{
+    return f32tof16(v.x) | (f32tof16(v.y) << 16);
+}
+
+void StoreVertex(uint v, float3 pos, uint color, uint uv)
+{
+    uint off = v * VERTEX_STRIDE;
+    _Verts.Store3(off, asuint(pos));
+    _Verts.Store(off + 12, color);
+    _Verts.Store(off + 16, uv);
+}
+
+[numthreads(64, 1, 1)]
+void BuildQuads(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)_TotalPoints) return;
+
+    float4 pt = _Points[i];
+    uint v0 = i * 4;
+    if (pt.w <= 0.0)
+    {
+        // нет данных: вырожденный квад, ничего не рисуется
+        float3 zero = float3(0.0, 0.0, 0.0);
+        StoreVertex(v0 + 0, zero, 0, 0);
+        StoreVertex(v0 + 1, zero, 0, 0);
+        StoreVertex(v0 + 2, zero, 0, 0);
+        StoreVertex(v0 + 3, zero, 0, 0);
+        return;
+    }
+
+    uint slot = i / (uint)_SlotSize;
+    uint age = ((uint)_WriteSlot + (uint)_History - slot) % (uint)_History;   // 0 = самый свежий кадр
+    float alpha = lerp(1.0, _MinAlpha, (float)age / (float)_History);
+    float t = saturate((pt.y - _FloorY) / _ColorHeightRange);
+    float3 rgb = Hsv2Rgb(float3((1.0 - t) * 0.66, 1.0, 1.0));   // низ = синий, верх = красный (как у частиц)
+    uint color = PackRgba8(float4(rgb, alpha));                  // Sprites/Default сам умножает rgb на alpha
+
+    float3 r = _CamRight.xyz * (_PointSize * 0.5);
+    float3 u = _CamUp.xyz * (_PointSize * 0.5);
+    float3 c = pt.xyz;
+    StoreVertex(v0 + 0, c - r - u, color, PackHalf2(float2(0.0, 0.0)));
+    StoreVertex(v0 + 1, c - r + u, color, PackHalf2(float2(0.0, 1.0)));
+    StoreVertex(v0 + 2, c + r + u, color, PackHalf2(float2(1.0, 1.0)));
+    StoreVertex(v0 + 3, c + r - u, color, PackHalf2(float2(1.0, 0.0)));
+}

@@ -1,14 +1,19 @@
 using System.Collections;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 /// <summary>
 /// Выключает passthrough и показывает облако точек датчика глубины (Depth API) в 3D.
-/// Точки берутся из ObstacleMap.OnDepthHit. Цвет = высота над полом (синий внизу, красный вверху).
+/// Основной режим (useGpuCloud): точки берутся из GPU-буфера DepthSampler (десятки тысяч, кольцевая история кадров)
+/// и рисуются обычным мешем со спрайтовым материалом: compute-шейдер каждый кадр строит квады прямо в вершинном буфере,
+/// CPU к точкам не прикасается. Старые кадры прозрачнее.
+/// Запасной режим (DepthSampler не готов или useGpuCloud выключен): частицы по ObstacleMap.OnDepthHit, как в v1.
+/// Цвет = высота над полом (синий внизу, красный вверху).
 ///
 /// Безопасность (без камер реального мира не видно!):
 ///  - кнопка B или Y переключает камеры;
 ///  - камеры включаются сами, если карта видит препятствие ближе autoPassthroughBelow
-///    ИЛИ несколько лучей подряд попадают ближе closeRayDistance (то, что ближе карты: стена, столб, предмет в руках).
+///    ИЛИ несколько точек подряд попадают ближе closeRayDistance (то, что ближе карты: стена, столб, предмет в руках).
 /// Скрипт создаётся сам при старте сцены.
 /// </summary>
 public class DepthPointCloud : MonoBehaviour
@@ -16,22 +21,32 @@ public class DepthPointCloud : MonoBehaviour
     [Header("Режим")]
     public bool startWithoutPassthrough = true;
     public bool toggleWithButtons = true;   // B (правый) / Y (левый)
+    [Tooltip("Рисовать облако из GPU-буфера DepthSampler. Выкл = частицы по OnDepthHit, как в v1")]
+    public bool useGpuCloud = true;
 
     [Header("Безопасность")]
-    [Tooltip("Автовключение камер. 0 = ВЫКЛЮЧЕНО (отключает и проверку близких лучей). Например 0.5 = включить при препятствии ближе 0.5 м")]
+    [Tooltip("Автовключение камер. 0 = ВЫКЛЮЧЕНО (отключает и проверку близких точек). Например 0.5 = включить при препятствии ближе 0.5 м")]
     public float autoPassthroughBelow = 0f;
-    [Tooltip("Если за кадр минимум closeRayCount лучей попали ближе этого расстояния, камеры включаются сами")]
+    [Tooltip("Если за кадр минимум closeRayCount точек (OnDepthHit) попали ближе этого расстояния, камеры включаются сами")]
     public float closeRayDistance = 0.4f;
+    [Tooltip("В режиме точек из текстуры событий в кадр в десятки раз больше, чем лучей: порог срабатывает легче")]
     public int closeRayCount = 3;
     public float autoHoldSeconds = 3f;
 
     [Header("Облако точек")]
+    [Tooltip("Частицы (запасной режим): максимум частиц")]
     public int maxPoints = 30000;
     public float pointLifetime = 2.5f;
-    [Tooltip("Сколько точек в кадр. maxEmitPerFrame * FPS * pointLifetime не должно сильно превышать maxPoints")]
+    [Tooltip("Частицы: сколько точек в кадр. maxEmitPerFrame * FPS * pointLifetime не должно сильно превышать maxPoints")]
     public int maxEmitPerFrame = 120;
+    [Tooltip("Размер точки, м (и для частиц, и для GPU-облака)")]
     public float pointSize = 0.025f;
     public float colorHeightRange = 2.5f;
+    [Tooltip("GPU-облако: прозрачность самого старого кадра истории (свежий кадр = 1)")]
+    [Range(0f, 1f)] public float minAlpha = 0.25f;
+
+    const int VertexStride = 20;    // float3 позиция + RGBA8 цвет + half2 uv, см. DepthSample.compute
+    const float WaitSamplerSeconds = 30f;
 
     ParticleSystem ps;
     ParticleSystemRenderer psRenderer;
@@ -39,6 +54,11 @@ public class DepthPointCloud : MonoBehaviour
     int emitted;
     int closeThisFrame;
     bool closeLastFrame;
+
+    Mesh cloudMesh;
+    MeshRenderer cloudRenderer;
+    GraphicsBuffer cloudVerts;
+    bool gpuCloudActive;
 
     ObstacleMap map;
     Camera cam;
@@ -57,15 +77,10 @@ public class DepthPointCloud : MonoBehaviour
 
     IEnumerator Start()
     {
-        float t = 0;
-        while ((FindFirstObjectByType<OVRCameraRig>() == null || ObstacleMap.Instance == null) && t < 15f)
-        {
-            t += Time.deltaTime;
-            yield return null;
-        }
+        yield return SonarCommon.WaitUntilReady(() => ObstacleMap.Instance != null);
 
-        var rig = FindFirstObjectByType<OVRCameraRig>();
-        if (rig != null) cam = rig.centerEyeAnchor.GetComponent<Camera>();
+        var head = SonarCommon.FindHead();
+        if (head != null) cam = head.GetComponent<Camera>();
         if (cam == null) cam = Camera.main;
         if (cam != null) { origFlags = cam.clearFlags; origBg = cam.backgroundColor; }
 
@@ -80,13 +95,19 @@ public class DepthPointCloud : MonoBehaviour
         map.OnDepthHit += OnHit;
 
         SetPassthrough(!startWithoutPassthrough);
+
+        if (useGpuCloud) StartCoroutine(SetupGpuCloud());
     }
 
     void OnDestroy()
     {
         if (map != null) map.OnDepthHit -= OnHit;
+        cloudVerts?.Dispose();
+        cloudVerts = null;
+        if (cloudMesh != null) Destroy(cloudMesh);
     }
 
+    // ---------------------------------------------------------------- частицы (запасной режим)
     void CreateCloud()
     {
         var go = new GameObject("PointCloudParticles");
@@ -117,8 +138,8 @@ public class DepthPointCloud : MonoBehaviour
         psRenderer = go.GetComponent<ParticleSystemRenderer>();
         psRenderer.renderMode = ParticleSystemRenderMode.Billboard;
         psRenderer.sortMode = ParticleSystemSortMode.None;
-        psRenderer.material = new Material(Shader.Find("Sprites/Default"));
-        psRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        psRenderer.material = SonarCommon.NewSpriteMaterial();
+        psRenderer.shadowCastingMode = ShadowCastingMode.Off;
         psRenderer.receiveShadows = false;
 
         ps.Play();
@@ -129,7 +150,7 @@ public class DepthPointCloud : MonoBehaviour
         if (cam != null && (p - cam.transform.position).sqrMagnitude < closeRayDistance * closeRayDistance)
             closeThisFrame++;
 
-        if (ps == null || emitted >= maxEmitPerFrame) return;
+        if (ps == null || gpuCloudActive || emitted >= maxEmitPerFrame) return;
         emitted++;
 
         float t = Mathf.Clamp01((p.y - map.floorY) / colorHeightRange);
@@ -141,6 +162,88 @@ public class DepthPointCloud : MonoBehaviour
         ps.Emit(ep, 1);
     }
 
+    // ---------------------------------------------------------------- GPU-облако (основной режим)
+    IEnumerator SetupGpuCloud()
+    {
+        // DepthSampler сам ждёт глубину до 15 с; ждём его решения (ready или failed)
+        DepthSampler ds = null;
+        float t = 0f;
+        while (t < WaitSamplerSeconds)
+        {
+            ds = DepthSampler.Instance;
+            if (ds != null && (ds.ready || ds.failed)) break;
+            t += Time.deltaTime;
+            yield return null;
+        }
+        if (ds == null || !ds.ready)
+        {
+            Debug.Log("DepthPointCloud: DepthSampler не готов, остаются частицы.");
+            yield break;
+        }
+        if (!CreateCloudMesh(ds)) yield break;
+
+        gpuCloudActive = true;
+        if (ps != null) ps.Clear();
+        SetPassthrough(passthroughOn);   // обновить видимость: меш вместо частиц
+        Debug.Log($"DepthPointCloud: GPU-облако на {ds.SlotSize * ds.History} точек.");
+    }
+
+    /// <summary>
+    /// Меш из квадов: 4 вершины по 20 байт на точку, статичные индексы. Вершины каждый кадр пишет compute-шейдер
+    /// (DepthSampler.BuildQuads) прямо в GPU-буфер меша, CPU-копия не трогается.
+    /// </summary>
+    bool CreateCloudMesh(DepthSampler ds)
+    {
+        int n = ds.SlotSize * ds.History;
+        var mesh = new Mesh { name = "DepthCloud", indexFormat = IndexFormat.UInt32 };
+        mesh.SetVertexBufferParams(n * 4,
+            new VertexAttributeDescriptor(VertexAttribute.Position, VertexAttributeFormat.Float32, 3),
+            new VertexAttributeDescriptor(VertexAttribute.Color, VertexAttributeFormat.UNorm8, 4),
+            new VertexAttributeDescriptor(VertexAttribute.TexCoord0, VertexAttributeFormat.Float16, 2));
+
+        var indices = new int[n * 6];
+        for (int i = 0, v = 0, k = 0; i < n; i++, v += 4)
+        {
+            indices[k++] = v; indices[k++] = v + 1; indices[k++] = v + 2;
+            indices[k++] = v; indices[k++] = v + 2; indices[k++] = v + 3;
+        }
+        const MeshUpdateFlags flags = MeshUpdateFlags.DontValidateIndices | MeshUpdateFlags.DontRecalculateBounds | MeshUpdateFlags.DontNotifyMeshUsers;
+        mesh.SetIndexBufferParams(indices.Length, IndexFormat.UInt32);
+        mesh.SetIndexBufferData(indices, 0, 0, indices.Length, flags);
+        mesh.subMeshCount = 1;
+        mesh.SetSubMesh(0, new SubMeshDescriptor(0, indices.Length, MeshTopology.Triangles), flags);
+        mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 2000f);   // точки в мировых координатах, не отсекать
+        mesh.vertexBufferTarget |= GraphicsBuffer.Target.Raw;           // доступ compute-шейдера к вершинам
+        mesh.UploadMeshData(false);
+
+        int stride = mesh.GetVertexBufferStride(0);
+        if (stride != VertexStride)
+        {
+            Debug.LogError($"DepthPointCloud: размер вершины {stride} байт вместо {VertexStride}, GPU-облако выключено, остаются частицы.");
+            Destroy(mesh);
+            return false;
+        }
+        cloudVerts = mesh.GetVertexBuffer(0);
+        if (cloudVerts == null)
+        {
+            Debug.LogError("DepthPointCloud: не удалось получить вершинный буфер меша, остаются частицы.");
+            Destroy(mesh);
+            return false;
+        }
+
+        var go = new GameObject("PointCloudMesh");
+        go.AddComponent<MeshFilter>().sharedMesh = mesh;
+        cloudRenderer = go.AddComponent<MeshRenderer>();
+        cloudRenderer.sharedMaterial = SonarCommon.NewSpriteMaterial();
+        cloudRenderer.shadowCastingMode = ShadowCastingMode.Off;
+        cloudRenderer.receiveShadows = false;
+        cloudRenderer.lightProbeUsage = LightProbeUsage.Off;
+        cloudRenderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
+        cloudMesh = mesh;
+        return true;
+    }
+
+    // ---------------------------------------------------------------- управление
     void Update()
     {
         if (map == null) return;
@@ -174,6 +277,13 @@ public class DepthPointCloud : MonoBehaviour
         emitted = 0;
         closeLastFrame = closeThisFrame >= closeRayCount;
         closeThisFrame = 0;
+
+        if (gpuCloudActive && !passthroughOn && cam != null)
+        {
+            var ds = DepthSampler.Instance;
+            if (ds != null && ds.ready)
+                ds.BuildQuads(cloudVerts, cam.transform.right, cam.transform.up, pointSize, map.floorY, colorHeightRange, minAlpha);
+        }
     }
 
     public void SetPassthrough(bool on)
@@ -189,6 +299,7 @@ public class DepthPointCloud : MonoBehaviour
             else { cam.clearFlags = CameraClearFlags.SolidColor; cam.backgroundColor = Color.black; }
         }
 
-        if (psRenderer != null) psRenderer.enabled = !on;
+        if (psRenderer != null) psRenderer.enabled = !on && !gpuCloudActive;
+        if (cloudRenderer != null) cloudRenderer.enabled = !on;
     }
 }

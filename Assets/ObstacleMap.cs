@@ -6,9 +6,13 @@ using UnityEngine;
 
 /// <summary>
 /// Карта препятствий в реальном времени (2D occupancy grid, вид сверху, мировые координаты).
-/// Только Depth API (EnvironmentRaycastManager), без MRUK. Подходит для ходьбы.
+/// Только Depth API, без комнатной модели MRUK. Подходит для ходьбы.
 ///
-///  1) Каждый кадр пускается raysPerFrame лучей из головы в поле зрения (последовательность Хэлтона).
+///  1) Источник точек (depthSource):
+///     - Texture: точки из текстуры глубины (DepthSampler): тысячи точек в кадр, копия с GPU с задержкой 1-3 кадра;
+///     - Raycast: каждый кадр пачка лучей EnvironmentRaycastManager из головы в поле зрения (последовательность Хэлтона):
+///       столько, сколько влезает в scanBudgetMs, либо фиксированные raysPerFrame (useTimeBudget = false);
+///     - Auto (по умолчанию): Texture, когда DepthSampler готов и его самопроверка в норме, иначе Raycast.
 ///  2) Попадание на высоте [stepHeight .. headClearance] над полом = препятствие (+log-odds).
 ///     Попадание в пол = проходимо. Потолок игнорируется.
 ///  3) Вдоль луча до точки попадания клетки "очищаются" (-log-odds): исчезнувшие предметы стираются.
@@ -20,6 +24,20 @@ using UnityEngine;
 public class ObstacleMap : MonoBehaviour
 {
     public static ObstacleMap Instance { get; private set; }
+
+    public enum DepthSource { Auto, Raycast, Texture }
+
+    [Header("Источник глубины")]
+    [Tooltip("Auto: точки из текстуры глубины (DepthSampler), если он готов и самопроверка в норме, иначе лучи. Raycast: всегда лучи (как в v1). Texture: точки, пока DepthSampler готов")]
+    public DepthSource depthSource = DepthSource.Auto;
+    [Tooltip("Auto: минимум валидных точек в кадре, чтобы перейти на текстуру")]
+    public int textureMinPoints = 500;
+    [Tooltip("Auto: если медианная ошибка самопроверки DepthSampler больше этого (м), остаёмся на лучах")]
+    public float textureMaxError = 0.10f;
+    [Tooltip("Режим точек: очищать клетки вдоль пути только к каждой N-й точке (обход клеток дорог для CPU)")]
+    public int carveEvery = 8;
+    [Tooltip("Режим точек: событие OnDepthHit (звук, частицы) только для каждой N-й точки")]
+    public int eventEvery = 4;
 
     [Header("Сетка")]
     public float cellSize = 0.1f;
@@ -83,8 +101,10 @@ public class ObstacleMap : MonoBehaviour
     public Vector3 nearestPoint;
     public int lastRays, lastHits;
     public float raysPerSecond;
-    [Tooltip("Сколько мс ушло на лучи в последнем кадре")]
+    [Tooltip("Сколько мс ушло на лучи или точки в последнем кадре")]
     public float scanMs;
+    [Tooltip("Откуда берутся точки сейчас (см. depthSource)")]
+    public DepthSource activeSource;
 
     /// <summary>Статусы лучей за последний кадр (для диагностики: почему нет попаданий).</summary>
     public readonly Dictionary<EnvironmentRaycastHitStatus, int> statusCounts = new();
@@ -94,6 +114,12 @@ public class ObstacleMap : MonoBehaviour
 
     const int Layers = 3;
     static readonly float[] LayerTop = { 0.6f, 1.2f, float.MaxValue };
+
+    const float MinHitDistance = 0.2f;    // ближе - считаем помехой (руки, шлем), не точкой
+    const float CarveStart = 0.25f;       // с какого расстояния от головы начинаем "очищать" клетки вдоль луча
+    const float SeenEps = 0.05f;          // |log-odds| меньше этого = клетка пустая, ничего не знаем
+    const float StatsInterval = 0.1f;     // как часто обновлять статистику, минимап и плитки, сек
+    const float PruneInterval = 2f;       // как часто удалять пустые и далёкие клетки, сек
 
     class Cell { public float[] l = new float[Layers]; }
 
@@ -106,12 +132,14 @@ public class ObstacleMap : MonoBehaviour
 
     Transform head;
     EnvironmentRaycastManager raycaster;
-    Material matGreen, matYellow, matRed;
+    Material matGreen, matYellow, matRed, mapMat;
     Texture2D mapTex;
     Color32[] mapPixels;
     TextMesh mapLabel;
     Vector3 lastFwd = Vector3.forward;
     int sampleIndex;
+    int seenReadback = -1, cursor, phase;   // режим Texture: какой readback обработан, позиция в нём и фаза подвыборки
+    bool pending;                            // режим Texture: в последнем readback остались необработанные точки
     float tick, pruneTick;
     int raysThisSecondCounter;
     float rayTimer;
@@ -127,23 +155,13 @@ public class ObstacleMap : MonoBehaviour
     IEnumerator Start()
     {
         Instance = this;
-        var shader = Shader.Find("Sprites/Default");
-        matGreen = MakeMat(shader, Color.green);
-        matYellow = MakeMat(shader, Color.yellow);
-        matRed = MakeMat(shader, Color.red);
+        matGreen = MakeMat(Color.green);
+        matYellow = MakeMat(Color.yellow);
+        matRed = MakeMat(Color.red);
 
-        float t = 0;
-        while ((FindFirstObjectByType<OVRCameraRig>() == null ||
-                FindFirstObjectByType<EnvironmentRaycastManager>() == null) && t < 15f)
-        {
-            t += Time.deltaTime;
-            yield return null;
-        }
+        yield return SonarCommon.WaitUntilReady(() => FindFirstObjectByType<EnvironmentRaycastManager>() != null);
 
-        var rig = FindFirstObjectByType<OVRCameraRig>();
-        if (rig != null) head = rig.centerEyeAnchor;
-        else if (Camera.main != null) head = Camera.main.transform;
-
+        head = SonarCommon.FindHead();
         raycaster = FindFirstObjectByType<EnvironmentRaycastManager>();
         if (head == null || raycaster == null)
         {
@@ -154,9 +172,19 @@ public class ObstacleMap : MonoBehaviour
         if (showMinimap) CreateMinimap();
     }
 
-    static Material MakeMat(Shader s, Color c)
+    void OnDestroy()
     {
-        var m = new Material(s);
+        if (Instance == this) Instance = null;
+        Destroy(matGreen);
+        Destroy(matYellow);
+        Destroy(matRed);
+        Destroy(mapMat);
+        Destroy(mapTex);
+    }
+
+    static Material MakeMat(Color c)
+    {
+        var m = SonarCommon.NewSpriteMaterial();
         m.color = c;
         return m;
     }
@@ -178,7 +206,7 @@ public class ObstacleMap : MonoBehaviour
         }
 
         tick += Time.deltaTime;
-        if (tick >= 0.1f)
+        if (tick >= StatsInterval)
         {
             if (memorySeconds > 0f) DecayMap(tick);
             tick = 0f;
@@ -188,7 +216,7 @@ public class ObstacleMap : MonoBehaviour
         }
 
         pruneTick += Time.deltaTime;
-        if (pruneTick >= 2f)
+        if (pruneTick >= PruneInterval)
         {
             pruneTick = 0f;
             Prune();
@@ -207,6 +235,79 @@ public class ObstacleMap : MonoBehaviour
 
     // ---------------------------------------------------------------- сканирование
     void Scan()
+    {
+        activeSource = ResolveSource();
+        if (activeSource == DepthSource.Texture) ScanTexture();
+        else ScanRays();
+    }
+
+    /// <summary>Какой источник использовать в этом кадре (см. depthSource).</summary>
+    DepthSource ResolveSource()
+    {
+        if (depthSource == DepthSource.Raycast) return DepthSource.Raycast;
+        var ds = DepthSampler.Instance;
+        bool have = ds != null && ds.ready && ds.Points != null;
+        if (depthSource == DepthSource.Texture) return have ? DepthSource.Texture : DepthSource.Raycast;
+
+        // Auto: нужны точки и приемлемая самопроверка (пока медианы нет, остаёмся на лучах)
+        if (!have || ds.validCount < textureMinPoints) return DepthSource.Raycast;
+        if (ds.calibrate && (ds.calibErrorMedian < 0f || ds.calibErrorMedian > textureMaxError)) return DepthSource.Raycast;
+        return DepthSource.Texture;
+    }
+
+    /// <summary>
+    /// Режим Texture: обход копии последнего кадра DepthSampler.Points. Каждый readback обрабатывается один раз,
+    /// в пределах scanBudgetMs за кадр (остаток - в следующем кадре). Очистка клеток вдоль пути и событие OnDepthHit
+    /// делаются для подвыборки точек (carveEvery, eventEvery); фаза подвыборки сдвигается с каждым новым кадром.
+    /// </summary>
+    void ScanTexture()
+    {
+        var ds = DepthSampler.Instance;
+        var pts = ds.Points;
+        int cEvery = Mathf.Max(1, carveEvery), eEvery = Mathf.Max(1, eventEvery);
+
+        if (ds.ReadbackFrame != seenReadback)
+        {
+            seenReadback = ds.ReadbackFrame;
+            cursor = 0;
+            phase = (phase + 1) % (cEvery * eEvery);
+            pending = true;
+        }
+
+        floorCandidate = float.MaxValue;
+        statusCounts.Clear();
+        if (!pending)
+        {
+            lastRays = 0;
+            lastHits = 0;
+            scanMs = 0f;
+            return;
+        }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Vector3 origin = head.position;
+        int processed = 0, hits = 0;
+        while (cursor < pts.Length)
+        {
+            int i = cursor++;
+            processed++;
+            Vector4 p = pts[i];
+            if (p.w <= 0f) continue;
+            int k = i + phase;
+            if (ProcessHit(origin, p, k % cEvery == 0, k % eEvery == 0)) hits++;
+            if (useTimeBudget && (processed & 63) == 0 && sw.Elapsed.TotalMilliseconds >= scanBudgetMs) break;
+        }
+        if (cursor >= pts.Length) pending = false;
+        scanMs = (float)sw.Elapsed.TotalMilliseconds;
+
+        LearnFloor();
+        lastRays = processed;
+        lastHits = hits;
+        raysThisSecondCounter += processed;
+    }
+
+    /// <summary>Режим Raycast: пачка лучей из головы в поле зрения, как в v1.</summary>
+    void ScanRays()
     {
         Vector3 origin = head.position;
         int hits = 0;
@@ -241,17 +342,19 @@ public class ObstacleMap : MonoBehaviour
         }
         scanMs = (float)sw.Elapsed.TotalMilliseconds;
 
-        // обучение высоты пола по лучам вниз
-        if (floorCandidate < float.MaxValue)
-        {
-            float eye = head.position.y - floorCandidate;
-            if (eye > 0.9f && eye < 2.2f)
-                learnedFloorY = float.IsNaN(learnedFloorY) ? floorCandidate : Mathf.Lerp(learnedFloorY, floorCandidate, 0.05f);
-        }
-
+        LearnFloor();
         lastRays = fired;
         lastHits = hits;
         raysThisSecondCounter += fired;
+    }
+
+    /// <summary>Обучение высоты пола по самой низкой точке кадра, полученной лучом или точкой вниз (floorCandidate).</summary>
+    void LearnFloor()
+    {
+        if (floorCandidate >= float.MaxValue) return;
+        float eye = head.position.y - floorCandidate;
+        if (eye > 0.9f && eye < 2.2f)
+            learnedFloorY = float.IsNaN(learnedFloorY) ? floorCandidate : Mathf.Lerp(learnedFloorY, floorCandidate, 0.05f);
     }
 
     bool ProcessRay(Vector3 origin, Vector3 dir)
@@ -261,33 +364,36 @@ public class ObstacleMap : MonoBehaviour
         statusCounts[hit.status] = sc + 1;
 
         if (!ok || hit.status != EnvironmentRaycastHitStatus.Hit) return false;
+        return ProcessHit(origin, hit.point, true, true);
+    }
 
-        float dist = Vector3.Distance(origin, hit.point);
-        if (dist < 0.2f) return false;
+    /// <summary>
+    /// Общая обработка точки поверхности (от луча или из текстуры глубины): событие OnDepthHit, пол,
+    /// классификация по высоте, запись в карту. carve = очищать клетки вдоль пути от головы до точки.
+    /// </summary>
+    bool ProcessHit(Vector3 origin, Vector3 point, bool carve, bool raiseEvent)
+    {
+        Vector3 dir = point - origin;
+        float dist = dir.magnitude;
+        if (dist < MinHitDistance) return false;
+        dir /= dist;
 
-        OnDepthHit?.Invoke(hit.point);
+        if (raiseEvent) OnDepthHit?.Invoke(point);
 
-        if (dir.y < -0.55f && dist < 2.5f && hit.point.y < floorCandidate) floorCandidate = hit.point.y;
+        if (dir.y < -0.55f && dist < 2.5f && point.y < floorCandidate) floorCandidate = point.y;
 
-        float h = hit.point.y - floorY;
+        float h = point.y - floorY;
 
-        if (h < stepHeight)
+        if (h < stepHeight || h > headClearance)
         {
-            // пол: путь свободен на всю длину луча
-            CarveFree(origin, dir, dist);
-            return true;
-        }
-
-        if (h > headClearance)
-        {
-            // потолок / что-то выше головы: свободно до него, препятствием не считаем
-            CarveFree(origin, dir, dist);
+            // пол или потолок / что-то выше головы: путь свободен на всю длину, препятствием не считаем
+            if (carve) CarveFree(origin, dir, dist);
             return true;
         }
 
         // препятствие в рабочем диапазоне высот
-        CarveFree(origin, dir, dist - cellSize * 1.2f);
-        Vector3 p = hit.point + dir * 0.03f;
+        if (carve) CarveFree(origin, dir, dist - cellSize * 1.2f);
+        Vector3 p = point + dir * 0.03f;
         AddLog(ToCell(p), LayerOf(h), hitAdd);
         return true;
     }
@@ -296,7 +402,7 @@ public class ObstacleMap : MonoBehaviour
     {
         var last = new Vector2Int(int.MinValue, int.MinValue);
         float step = cellSize * 0.8f;
-        for (float d = 0.25f; d < until; d += step)
+        for (float d = CarveStart; d < until; d += step)
         {
             Vector3 p = origin + dir * d;
             float h = p.y - floorY;
@@ -383,14 +489,30 @@ public class ObstacleMap : MonoBehaviour
             if (!IsCellOcc(kv.Value)) continue;
             occ++;
             Vector3 c = CellCenter(kv.Key);
-            float dx = c.x - hp.x, dz = c.z - hp.z;
-            float d = Mathf.Sqrt(dx * dx + dz * dz);
-            if (d < best) { best = d; bestP = c; }
+            float d2 = HorizSqrDistance(c, hp);
+            if (d2 < best) { best = d2; bestP = c; }
         }
 
         occupiedCount = occ;
-        nearestDistance = best < float.MaxValue ? best : -1f;
+        nearestDistance = best < float.MaxValue ? Mathf.Sqrt(best) : -1f;
         nearestPoint = bestP;
+    }
+
+    static float HorizSqrDistance(Vector3 a, Vector3 b)
+    {
+        float dx = a.x - b.x, dz = a.z - b.z;
+        return dx * dx + dz * dz;
+    }
+
+    /// <summary>Подпись источника точек для HUD и миникарты.</summary>
+    public string SourceLabel => activeSource == DepthSource.Texture ? "точки" : "лучи";
+
+    /// <summary>Цвет по расстоянию до ближайшего препятствия: красный (опасно), жёлтый (близко), иначе белый.</summary>
+    public Color LevelColor()
+    {
+        if (nearestDistance < 0f) return Color.white;
+        if (nearestDistance < dangerDistance) return Color.red;
+        return nearestDistance < warnDistance ? Color.yellow : Color.white;
     }
 
     /// <summary>Плавное забывание: все значения log-odds стремятся к нулю с постоянной времени memorySeconds.</summary>
@@ -410,6 +532,13 @@ public class ObstacleMap : MonoBehaviour
         return false;
     }
 
+    /// <summary>Клетка хоть что-то "знает" (свободно или занято), а не пустая.</summary>
+    static bool IsCellSeen(Cell c)
+    {
+        for (int i = 0; i < Layers; i++) if (Mathf.Abs(c.l[i]) > SeenEps) return true;
+        return false;
+    }
+
     void Prune()
     {
         tmpKeys.Clear();
@@ -417,12 +546,8 @@ public class ObstacleMap : MonoBehaviour
         float r2 = keepRadius * keepRadius;
         foreach (var kv in cells)
         {
-            Vector3 c = CellCenter(kv.Key);
-            float dx = c.x - hp.x, dz = c.z - hp.z;
-            bool far = dx * dx + dz * dz > r2;
-            bool empty = true;
-            for (int i = 0; i < Layers; i++) if (Mathf.Abs(kv.Value.l[i]) > 0.05f) { empty = false; break; }
-            if (far || empty) tmpKeys.Add(kv.Key);
+            bool far = HorizSqrDistance(CellCenter(kv.Key), hp) > r2;
+            if (far || !IsCellSeen(kv.Value)) tmpKeys.Add(kv.Key);
         }
         foreach (var k in tmpKeys) cells.Remove(k);
     }
@@ -441,9 +566,9 @@ public class ObstacleMap : MonoBehaviour
         quad.transform.SetParent(head, false);
         quad.transform.localPosition = minimapOffset;
         quad.transform.localScale = Vector3.one * minimapSize;
-        var m = new Material(Shader.Find("Sprites/Default"));
-        m.mainTexture = mapTex;
-        quad.GetComponent<Renderer>().sharedMaterial = m;
+        mapMat = SonarCommon.NewSpriteMaterial();
+        mapMat.mainTexture = mapTex;
+        quad.GetComponent<Renderer>().sharedMaterial = mapMat;
 
         var lg = new GameObject("MinimapLabel");
         lg.transform.SetParent(quad.transform, false);
@@ -482,15 +607,7 @@ public class ObstacleMap : MonoBehaviour
 
                 Color32 col = unknown;
                 if (cells.TryGetValue(key, out var c))
-                {
-                    bool occ = false, seen = false;
-                    for (int i = 0; i < Layers; i++)
-                    {
-                        if (c.l[i] >= occThreshold) occ = true;
-                        if (Mathf.Abs(c.l[i]) > 0.05f) seen = true;
-                    }
-                    col = occ ? occC : seen ? freeC : unknown;
-                }
+                    col = IsCellOcc(c) ? occC : IsCellSeen(c) ? freeC : unknown;
                 mapPixels[y * n + x] = col;
             }
         }
@@ -509,10 +626,9 @@ public class ObstacleMap : MonoBehaviour
         {
             var sb = new StringBuilder();
             sb.AppendLine(nearestDistance >= 0 ? $"Ближайшее: {nearestDistance:F1} м" : "Ближайшее: -");
-            sb.Append($"Клеток: {occupiedCount}  лучи {lastHits}/{lastRays}  {raysPerSecond:F0}/с");
+            sb.Append($"Клеток: {occupiedCount}  {SourceLabel} {lastHits}/{lastRays}  {raysPerSecond:F0}/с");
             mapLabel.text = sb.ToString();
-            mapLabel.color = nearestDistance >= 0 && nearestDistance < dangerDistance ? Color.red
-                           : nearestDistance >= 0 && nearestDistance < warnDistance ? Color.yellow : Color.white;
+            mapLabel.color = LevelColor();
         }
     }
 
@@ -528,8 +644,7 @@ public class ObstacleMap : MonoBehaviour
             if (used >= max3DTiles) break;
             if (!IsCellOcc(kv.Value)) continue;
             Vector3 c = CellCenter(kv.Key);
-            float dx = c.x - hp.x, dz = c.z - hp.z;
-            float d2 = dx * dx + dz * dz;
+            float d2 = HorizSqrDistance(c, hp);
             if (d2 > r2) continue;
             PlaceTile(used++, new Vector3(c.x, floorY + 0.015f, c.z), Mathf.Sqrt(d2));
         }
